@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 
@@ -236,3 +237,232 @@ def test_restart_marks_interrupted_and_resume_keeps_completed(api_components):
             await scpi.set_delay(0.02)
 
     portal.call(scenario)
+
+
+def test_cancel_winning_publish_race_discards_readings(api_components):
+    """取数结束、保存前取消先获准：批次不得完成，读数不得落库也不得被查询到。"""
+    from app.schemas import BatchStatus
+
+    portal, settings, db, scpi, coordinator = api_components
+
+    async def scenario():
+        await scpi.set_delay(0.05)
+        await db.connect()
+        await coordinator.startup()
+        try:
+            original_complete = db.complete_batch
+            cancel_outcome = {}
+
+            async def cancel_wins(batch_id, channels, values):
+                # 模拟“取数结束、保存前取消”的临界交错：取消先提交
+                cancel_outcome.update(await coordinator.request_cancel(batch_id))
+                return await original_complete(batch_id, channels, values)
+
+            db.complete_batch = cancel_wins
+            try:
+                await db.create_batch("B-RACE-CANCEL", [101, 102])
+                await coordinator.enqueue("B-RACE-CANCEL")
+                row = await _wait_db(db, "B-RACE-CANCEL", {"CANCELLED"})
+            finally:
+                db.complete_batch = original_complete
+
+            # 取消返回已受理后，批次必须停在 CANCELLED，不得随后完成
+            assert cancel_outcome["accepted"] is True
+            assert cancel_outcome["status"] == BatchStatus.CANCELLING
+            assert row["status"] == "CANCELLED"
+            # 不再发布：批次读数与通道历史都供不出该批读数
+            assert await db.get_readings_for_batch("B-RACE-CANCEL") == []
+            assert await db.get_readings_for_channel(101) == []
+            assert await db.get_readings_for_channel(102) == []
+        finally:
+            await coordinator.shutdown()
+            await db.close()
+
+    portal.call(scenario)
+
+
+def test_publish_winning_race_makes_cancel_refused(api_components):
+    """完成（含完整读数）先提交：取消必须被告知不可取消，读数完整可查。"""
+    from app.schemas import BatchStatus
+
+    portal, settings, db, scpi, coordinator = api_components
+
+    async def scenario():
+        await scpi.set_delay(0.05)
+        await db.connect()
+        await coordinator.startup()
+        try:
+            original_complete = db.complete_batch
+            cancel_outcome = {}
+            cancel_done = asyncio.Event()
+
+            async def publish_wins(batch_id, channels, values):
+                published = await original_complete(batch_id, channels, values)
+                assert published is True
+                # 完成已提交，紧随其后的取消必须被拒
+                cancel_outcome.update(await coordinator.request_cancel(batch_id))
+                cancel_done.set()
+                return published
+
+            db.complete_batch = publish_wins
+            try:
+                await db.create_batch("B-RACE-DONE", [103, 104])
+                await coordinator.enqueue("B-RACE-DONE")
+                await _wait_db(db, "B-RACE-DONE", {"COMPLETED"})
+                # 完成登记先于包装器里的取消调用，等取消结论落地再断言
+                await asyncio.wait_for(cancel_done.wait(), timeout=5.0)
+            finally:
+                db.complete_batch = original_complete
+
+            assert cancel_outcome["accepted"] is False
+            assert cancel_outcome["status"] == BatchStatus.COMPLETED
+            assert "不可取消" in cancel_outcome["message"]
+            readings = await db.get_readings_for_batch("B-RACE-DONE")
+            assert [r["channel"] for r in readings] == [103, 104]
+            assert len(await db.get_readings_for_channel(103)) == 1
+        finally:
+            await coordinator.shutdown()
+            await db.close()
+
+    portal.call(scenario)
+
+
+def test_queued_cancel_racing_worker_start_never_runs(api_components):
+    """worker 刚取出批次、尚未置 RUNNING 时取消先提交：批次不得执行。"""
+    from app.schemas import BatchStatus
+
+    portal, settings, db, scpi, coordinator = api_components
+
+    async def scenario():
+        await db.connect()
+        await coordinator.startup()
+        try:
+            original_transition = db.try_transition
+            injected = False
+
+            async def cancel_slips_in(batch_id, from_states, to, **kwargs):
+                nonlocal injected
+                if not injected and to == BatchStatus.RUNNING:
+                    injected = True
+                    # 取消抢在 worker 置 RUNNING 前提交
+                    assert await original_transition(
+                        batch_id, {BatchStatus.QUEUED}, BatchStatus.CANCELLED,
+                        finished=True)
+                return await original_transition(
+                    batch_id, from_states, to, **kwargs)
+
+            db.try_transition = cancel_slips_in
+            try:
+                await db.create_batch("B-RACE-QUEUED", [101])
+                await coordinator.enqueue("B-RACE-QUEUED")
+                row = await _wait_db(db, "B-RACE-QUEUED", {"CANCELLED"})
+            finally:
+                db.try_transition = original_transition
+
+            assert injected  # 确实走到了临界交错
+            assert row["started_at"] is None  # 从未进入执行
+            assert await db.get_readings_for_batch("B-RACE-QUEUED") == []
+        finally:
+            await coordinator.shutdown()
+            await db.close()
+
+    portal.call(scenario)
+
+
+def test_restart_resume_clears_remnants_and_publishes_once(api_components):
+    """旧版残件现场（读数已落库、批次未完成）重启后：
+
+    - 中断/未完成批次的残件读数，批次与通道查询都不可见；
+    - 接续重扫后每个所选通道恰好一条本次读数（残件被清除而非叠加）；
+    - 已完成批次及其读数保持不变。
+    """
+    from app.main import AppState
+    from app.schemas import BatchStatus
+
+    portal, settings, db, scpi, coordinator = api_components
+
+    async def scenario():
+        await scpi.set_delay(0.05)
+        await db.connect()
+        await coordinator.startup()
+        try:
+            # 正常完成一个批次作对照
+            await db.create_batch("B-OK", [101])
+            await coordinator.enqueue("B-OK")
+            await _wait_db(db, "B-OK", {"COMPLETED"})
+
+            # 构造旧版崩溃现场：批次 RUNNING，两条读数已落库但未登记完成
+            await db.create_batch("B-LEGACY", [101, 102])
+            assert await db.try_transition(
+                "B-LEGACY", {BatchStatus.QUEUED}, BatchStatus.RUNNING,
+                started=True)
+            await db.db.execute(
+                "INSERT INTO readings "
+                "(batch_id, channel, position, value, recorded_at) VALUES "
+                "('B-LEGACY', 101, 0, 9.999, '2000-01-01T00:00:00+00:00'), "
+                "('B-LEGACY', 102, 1, 8.888, '2000-01-01T00:00:00+00:00')")
+
+            # 未完成批次的残件读数：批次与通道查询都不可见
+            assert await db.get_readings_for_batch("B-LEGACY") == []
+            ch101 = await db.get_readings_for_channel(101)
+            assert [r["batch_id"] for r in ch101] == ["B-OK"]
+        finally:
+            await coordinator.shutdown()
+            await db.close()
+
+        # 模拟重启：同一 DB 文件全新装配
+        new_state = AppState(settings)
+        await new_state.db.connect()
+        interrupted = await new_state.coordinator.startup()
+        try:
+            assert "B-LEGACY" in interrupted
+            # 中断状态下残件仍不可见
+            assert await new_state.db.get_readings_for_batch("B-LEGACY") == []
+            ch101 = await new_state.db.get_readings_for_channel(101)
+            assert [r["batch_id"] for r in ch101] == ["B-OK"]
+
+            # 接续：重扫后每通道恰好一条本次读数，残件被清除而非叠加
+            assert await new_state.coordinator.resume("B-LEGACY") is True
+            await _wait_db(new_state.db, "B-LEGACY", {"COMPLETED"})
+            readings = await new_state.db.get_readings_for_batch("B-LEGACY")
+            assert [r["channel"] for r in readings] == [101, 102]
+            assert len(readings) == 2
+            assert all(r["value"] not in (9.999, 8.888) for r in readings)
+            # 通道 101 历史恰为两条（B-OK 与 B-LEGACY 各一），残件未叠加
+            ch101 = await new_state.db.get_readings_for_channel(101)
+            assert sorted(r["batch_id"] for r in ch101) == ["B-LEGACY", "B-OK"]
+            # 已完成批次保持不变
+            assert len(await new_state.db.get_readings_for_batch("B-OK")) == 1
+        finally:
+            await new_state.coordinator.shutdown()
+            await new_state.db.close()
+
+    portal.call(scenario)
+
+
+def test_cancel_and_status_do_not_wait_for_scan(api_client):
+    """取消受理与状态查询不等待仪器扫描结束。"""
+    client, _app, _port, scpi, portal = api_client
+    # 3 通道 × 0.8s ≈ 2.4s 扫描（低于 3 秒超时）
+    portal.call(scpi.set_delay, 0.8)
+
+    batch = client.post("/batches",
+                        json={"channels": [101, 102, 103]}).json()
+    _wait_status(client, batch["id"], {"RUNNING"})
+
+    t0 = time.monotonic()
+    status = client.get(f"/batches/{batch['id']}").json()
+    assert time.monotonic() - t0 < 1.5
+    assert status["status"] == "RUNNING"
+
+    t0 = time.monotonic()
+    result = client.post(f"/batches/{batch['id']}/cancel").json()
+    cancel_elapsed = time.monotonic() - t0
+    assert result["accepted"] is True
+    # 扫描还需约 2 秒才结束，受理必须远早于此
+    assert cancel_elapsed < 1.5
+
+    _wait_status(client, batch["id"], {"CANCELLED"})
+    assert client.get(
+        f"/batches/{batch['id']}/readings").json()["readings"] == []
+    portal.call(scpi.set_delay, 0.02)
