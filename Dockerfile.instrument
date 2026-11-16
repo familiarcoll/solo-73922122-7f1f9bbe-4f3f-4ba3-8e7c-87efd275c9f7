@@ -1,0 +1,9 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY instrument ./instrument
+
+ENV PYTHONUNBUFFERED=1
+EXPOSE 5025
+
+CMD ["python", "-m", "instrument.scpi_device"]

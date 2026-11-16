@@ -1,0 +1,37 @@
+services:
+  instrument:
+    build:
+      context: .
+      dockerfile: Dockerfile.instrument
+    image: lab-scpi-instrument:dev
+    container_name: lab-scpi-instrument
+    environment:
+      INSTRUMENT_HOST: "0.0.0.0"
+      INSTRUMENT_PORT: "5025"
+    ports:
+      # 主机可用 nc/telnet 5026 直连演示 SCPI 仪器
+      - "5026:5025"
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    image: lab-collector-api:dev
+    container_name: lab-collector-api
+    depends_on:
+      instrument:
+        condition: service_started
+    environment:
+      INSTRUMENT_HOST: instrument
+      INSTRUMENT_PORT: "5025"
+      DB_PATH: /data/collector.db
+      SCAN_TIMEOUT_SECONDS: "3"
+    ports:
+      - "8000:8000"
+    volumes:
+      - collector-data:/data
+    restart: unless-stopped
+
+volumes:
+  collector-data:
